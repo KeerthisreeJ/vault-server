@@ -17,9 +17,6 @@ jobs:
   test_and_lint:
     name: Test & Lint Server
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ./vault-server
 
     steps:
       - name: Checkout repository
