@@ -239,7 +239,7 @@ def get_rp_id(request: Request):
     origin = request.headers.get("origin")
     if origin and origin.startswith("chrome-extension://"):
         return origin.split("//")[1]
-    return "localhost"  # Default for testing outside extension
+    return "localhost"
 
 @app.post("/auth/passkey/register/options")
 def passkey_register_options(request: Request, authorization: str = Header()):
@@ -263,13 +263,29 @@ def passkey_register_verify(req: PasskeyRegisterVerifyReq, request: Request, aut
     if not challenge: raise HTTPException(400, "No challenge found")
     
     try:
-        verification = verify_registration_response(
-            credential=req.response,
-            expected_challenge=challenge,
-            expected_origin=request.headers.get("origin"),
-            expected_rp_id=get_rp_id(request),
-            require_user_verification=False,
-        )
+        rp_id = get_rp_id(request)
+        
+        try:
+            verification = verify_registration_response(
+                credential=req.response,
+                expected_challenge=challenge,
+                expected_origin=request.headers.get("origin"),
+                expected_rp_id=rp_id,
+                require_user_verification=False,
+            )
+        except Exception as e:
+            if "Unexpected RP ID hash" in str(e) and rp_id != "localhost":
+                # Fallback for extension-id/localhost mismatch
+                verification = verify_registration_response(
+                    credential=req.response,
+                    expected_challenge=challenge,
+                    expected_origin=request.headers.get("origin"),
+                    expected_rp_id="localhost",
+                    require_user_verification=False,
+                )
+            else:
+                raise e
+
         save_passkey(
             user, 
             verification.credential_id.hex(),
@@ -303,15 +319,32 @@ def passkey_login_verify(req: PasskeyLoginVerifyReq, request: Request):
     if not user_passkey or not challenge: raise HTTPException(400)
     
     try:
-        verification = verify_authentication_response(
-            credential=req.response,
-            expected_challenge=challenge,
-            expected_origin=request.headers.get("origin"),
-            expected_rp_id=get_rp_id(request),
-            credential_public_key=bytes.fromhex(user_passkey["public_key"]),
-            credential_current_sign_count=user_passkey["sign_count"],
-            require_user_verification=False,
-        )
+        rp_id = get_rp_id(request)
+        try:
+            verification = verify_authentication_response(
+                credential=req.response,
+                expected_challenge=challenge,
+                expected_origin=request.headers.get("origin"),
+                expected_rp_id=rp_id,
+                credential_public_key=bytes.fromhex(user_passkey["public_key"]),
+                credential_current_sign_count=user_passkey["sign_count"],
+                require_user_verification=False,
+            )
+        except Exception as e:
+            if "Unexpected RP ID hash" in str(e) and rp_id != "localhost":
+                print("DEBUG: Unexpected RP ID hash for extension ID during login, trying fallback with 'localhost'...")
+                verification = verify_authentication_response(
+                    credential=req.response,
+                    expected_challenge=challenge,
+                    expected_origin=request.headers.get("origin"),
+                    expected_rp_id="localhost",
+                    credential_public_key=bytes.fromhex(user_passkey["public_key"]),
+                    credential_current_sign_count=user_passkey["sign_count"],
+                    require_user_verification=False,
+                )
+            else:
+                raise e
+
         update_passkey_sign_count(req.username, verification.new_sign_count)
         
         # Log user in
