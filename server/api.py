@@ -32,6 +32,11 @@ from server.auth import (
     verify_mfa,          # check a 6-digit TOTP code and enable MFA
     check_mfa_enabled,   # return True/False whether MFA is active for a user
     disable_mfa,         # turn off MFA for a user
+    CHALLENGES,
+    save_passkey,
+    get_passkey,
+    update_passkey_sign_count,
+    SESSIONS
 )
 
 from server.storage import store_blob, load_blob   # encrypted vault blob I/O
@@ -81,6 +86,17 @@ class MFALoginReq(BaseModel):
 class RestoreReq(BaseModel):
     """Body for POST /backups/restore — specifies which backup to restore."""
     filename: str   # bare filename only (e.g. backup_alice_20260221_080000_123456.enc)
+
+
+# ── WebAuthn Models ──
+class PasskeyRegisterVerifyReq(BaseModel):
+    username: str
+    response: dict
+    encrypted_master: str
+
+class PasskeyLoginVerifyReq(BaseModel):
+    username: str
+    response: dict
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -192,6 +208,113 @@ def logout(authorization: str = Header(None)):
         pass # Token already invalid or expired
         
     return {"ok": True}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Passkey (WebAuthn) endpoints
+# ══════════════════════════════════════════════════════════════════════════════
+from webauthn import (
+    generate_registration_options,
+    verify_registration_response,
+    generate_authentication_options,
+    verify_authentication_response,
+    options_to_json,
+)
+from webauthn.helpers.structs import PublicKeyCredentialDescriptor
+import json
+
+# Adjust domains as necessary for prod
+RP_NAME = "SecureVault"
+
+def get_rp_id(request: Request):
+    origin = request.headers.get("origin")
+    if origin and origin.startswith("chrome-extension://"):
+        return origin.split("//")[1]
+    return "localhost"  # Default for testing outside extension
+
+@app.post("/auth/passkey/register/options")
+def passkey_register_options(request: Request, authorization: str = Header()):
+    username = require_auth(authorization)
+    rp_id = get_rp_id(request)
+    options = generate_registration_options(
+        rp_id=rp_id,
+        rp_name=RP_NAME,
+        user_id=username.encode('utf-8'),
+        user_name=username,
+    )
+    CHALLENGES[username] = options.challenge
+    return json.loads(options_to_json(options))
+
+@app.post("/auth/passkey/register/verify")
+def passkey_register_verify(req: PasskeyRegisterVerifyReq, request: Request, authorization: str = Header()):
+    user = require_auth(authorization)
+    if user != req.username: raise HTTPException(401)
+    
+    challenge = CHALLENGES.get(user)
+    if not challenge: raise HTTPException(400, "No challenge found")
+    
+    try:
+        verification = verify_registration_response(
+            credential=req.response,
+            expected_challenge=challenge,
+            expected_origin=request.headers.get("origin"),
+            expected_rp_id=get_rp_id(request),
+            require_user_verification=False,
+        )
+        save_passkey(
+            user, 
+            verification.credential_id.hex(),
+            verification.credential_public_key.hex(),
+            verification.sign_count,
+            req.encrypted_master
+        )
+        log_action(user, "PASSKEY_REGISTER", "Registered a new passkey")
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/auth/passkey/login/options")
+def passkey_login_options(username: str, request: Request):
+    user_passkey = get_passkey(username)
+    if not user_passkey: raise HTTPException(404, "Passkey not found for user")
+    
+    options = generate_authentication_options(
+        rp_id=get_rp_id(request),
+        allow_credentials=[
+            PublicKeyCredentialDescriptor(id=bytes.fromhex(user_passkey["credential_id"]))
+        ],
+    )
+    CHALLENGES[username] = options.challenge
+    return json.loads(options_to_json(options))
+
+@app.post("/auth/passkey/login/verify")
+def passkey_login_verify(req: PasskeyLoginVerifyReq, request: Request):
+    challenge = CHALLENGES.get(req.username)
+    user_passkey = get_passkey(req.username)
+    if not user_passkey or not challenge: raise HTTPException(400)
+    
+    try:
+        verification = verify_authentication_response(
+            credential=req.response,
+            expected_challenge=challenge,
+            expected_origin=request.headers.get("origin"),
+            expected_rp_id=get_rp_id(request),
+            credential_public_key=bytes.fromhex(user_passkey["public_key"]),
+            credential_current_sign_count=user_passkey["sign_count"],
+            require_user_verification=False,
+        )
+        update_passkey_sign_count(req.username, verification.new_sign_count)
+        
+        # Log user in
+        token = secrets.token_hex(32)
+        SESSIONS[token] = req.username
+        log_action(req.username, "LOGIN_PASSKEY", "User logged in with passkey")
+        
+        return {
+            "token": token,
+            "encrypted_master": user_passkey["encrypted_master"]
+        }
+    except Exception as e:
+        raise HTTPException(401, str(e))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
