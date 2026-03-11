@@ -4,9 +4,19 @@ from pydantic import BaseModel
 from pathlib import Path
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 import secrets
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # In production, you might want to restrict this to your extension IDs
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 security = HTTPBasic()
 
 def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
@@ -50,7 +60,7 @@ from server.backup import (                         # encrypted backup managemen
 from server.audit import log_action, get_logs       # audit trail for security events
 
 # ── Application instance ───────────────────────────────────────────────────────
-app = FastAPI()
+# (App already initialized above)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
